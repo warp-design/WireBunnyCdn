@@ -1,0 +1,400 @@
+<?php
+
+namespace ProcessWire;
+
+/**
+ * @package   WireBunnyCdn
+ * @author    Jonathan G <Warp Designk>
+ * @link      https://warp-design.co.uk
+ * @copyright Copyright (c) Warp Design
+ * @license   https://opensource.org/licenses/MIT
+ */
+
+class WireBunnyCdn extends WireData implements Module, ConfigurableModule
+{
+
+    public static function getModuleInfo()
+    {
+        return [
+            'title' => 'WireBunnyCdn',
+            'version' => 0.1,
+            'summary' => 'BETA: Allows offloading of images/files to Bunny Storage and rewriting URLs to a Bunny CDN domain whilst retaining core ProcessWire image/file handling and sizing functionality.',
+            'autoload' => true,
+            'singular' => true,
+            'requires' => ['ProcessWire>=3.0.150']
+        ];
+    }
+
+    /** @var string */
+    protected $cdnDomain;
+    /** @var bool */
+    protected $offloadEnabled;
+    /** @var string */
+    protected $storageZone;
+    /** @var string */
+    protected $storageAccessKey;
+    /** @var string */
+    protected $storageRegion; // optional; Bunny has regions
+    /** @var bool */
+    protected $preferLocalIfExists;
+    /** @var bool */
+    protected $useBunnyOptimizerForSize;
+
+    public function __construct()
+    {
+        parent::__construct();
+    }
+
+    public function init()
+    {
+        $cfg = $this->wire('modules')->getConfig($this) ?: [];
+
+        $this->cdnDomain                  = rtrim((string)($cfg['cdnDomain'] ?? ''), '/');
+        $this->offloadEnabled             = (bool)($cfg['offloadEnabled'] ?? false);
+        $this->storageZone                = (string)($cfg['storageZone'] ?? '');
+        $this->storageAccessKey           = (string)($cfg['storageAccessKey'] ?? '');
+        $this->storageRegion              = (string)($cfg['storageRegion'] ?? '');
+        $this->preferLocalIfExists        = (bool)($cfg['preferLocalIfExists'] ?? false);
+        $this->useBunnyOptimizerForSize   = (bool)($cfg['useBunnyOptimizerForSize'] ?? false);
+
+        if ($this->cdnDomain) {
+            $this->addHookAfter('Pagefile::url', $this, 'rewriteUrlToCDN');
+        }
+
+        if ($this->offloadEnabled) {
+            $this->addHookAfter('Pages::saved', $this, 'offloadFilesForPage');
+            $this->addHookAfter('Pagefile::deleted', $this, 'deleteFromStorage');
+            // Instant offload of newly created variations
+            $this->addHookAfter('Pageimage::size', $this, 'afterImageSize');
+        }
+    }
+
+    /** Config screen */
+    public static function getModuleConfigInputfields(array $data)
+    {
+        $inputfields = new InputfieldWrapper();
+
+        $f = wire('modules')->get('InputfieldText');
+        $f->name = 'cdnDomain';
+        $f->label = 'CDN domain (https://cdn.example.com)';
+        $f->value = $data['cdnDomain'] ?? '';
+        $f->required = true;
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldCheckbox');
+        $f->name = 'offloadEnabled';
+        $f->label = 'Offload files to Bunny Storage (instead of local)';
+        $f->checked = !empty($data['offloadEnabled']);
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldText');
+        $f->name = 'storageZone';
+        $f->label = 'Bunny Storage Zone Name';
+        $f->value = $data['storageZone'] ?? '';
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldText');
+        $f->name = 'storageAccessKey';
+        $f->label = 'Bunny Storage Access Key';
+        $f->value = $data['storageAccessKey'] ?? '';
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldText');
+        $f->name = 'storageRegion';
+        $f->label = 'Bunny Storage Region (optional, e.g. de, uk)';
+        $f->value = $data['storageRegion'] ?? '';
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldCheckbox');
+        $f->name = 'preferLocalIfExists';
+        $f->label = 'Prefer local URL if the file exists locally (front-end only)';
+        $f->checked = !empty($data['preferLocalIfExists']);
+        $inputfields->add($f);
+
+        $f = wire('modules')->get('InputfieldCheckbox');
+        $f->name = 'useBunnyOptimizerForSize';
+        $f->label = 'Use Bunny Optimizer for sized image URLs (rewrite variations to ?width=&height=)';
+        $f->notes = 'Requires Bunny Optimizer enabled on your Pull Zone.';
+        $f->checked = !empty($data['useBunnyOptimizerForSize']);
+        $inputfields->add($f);
+
+
+        return $inputfields;
+    }
+
+    public function rewriteUrlToCDN(HookEvent $event)
+    {
+        if (!$this->cdnDomain) return;
+
+        /** @var Pagefile $pf */
+        $pf  = $event->object;
+        $url = $event->return;
+
+        // Handle front end image rendering - note in admin remote URLs may not display until page is saved and image is uploaded to CDN
+        $absPath = parse_url($this->config->urls->httpRoot . ltrim($url, '/'), PHP_URL_PATH);
+
+        // Prefer local if the physical file exists - this helps if you have existing local files you want to keep using from before CDN was implemented
+        if ($this->preferLocalIfExists) {
+            $localPath = $pf->filename(); // absolute file path
+            if (is_file($localPath)) {
+                // Leave $event->return untouched (local URL)
+                return;
+            }
+        }
+
+        /**
+         * Handle image sizing either with Bunny Optimizer or ProcessWire variations:
+         */
+        // (2) If using Bunny Optimizer for sized variations, detect dimensions in filename
+        if ($this->useBunnyOptimizerForSize && $pf instanceof Pageimage) {
+            // If this Pageimage is a variation like .../image.80x80.jpg, parse dims
+            if (preg_match('~\.(\d+)x(\d+)(?:\.[a-z0-9]+)$~i', $pf->basename())) {
+                [$w, $h] = $this->parseVariationDims($pf);
+                if ($w || $h) {
+                    // Build URL to the ORIGINAL image on CDN + ?width=&height=
+                    $orig = method_exists($pf, 'getOriginal') ? $pf->getOriginal() : null;
+                    if ($orig instanceof Pageimage) {
+                        $origPath = parse_url($this->config->urls->httpRoot . ltrim($orig->url, '/'), PHP_URL_PATH);
+                        $base = $this->buildCdnBase($origPath);
+                        // Minimal set: width/height (Bunny Optimizer fits/crops depending on settings) 
+                        // You can extend with quality/format/etc later.
+                        $qs = [];
+                        if ($w) $qs[] = 'width=' . (int)$w;
+                        if ($h) $qs[] = 'height=' . (int)$h;
+                        $event->return = $base . (count($qs) ? ('?' . implode('&', $qs)) : '');
+                        return;
+                    }
+                }
+            }
+        }
+
+        // (3) Default: just rewrite to CDN host (works for originals and pre-rendered variations)
+        $event->return = $this->buildCdnBase($absPath);
+    }
+
+
+    /** After saving a page, push originals + variations to storage and (optionally) remove local */
+    public function offloadFilesForPage(HookEvent $event)
+    {
+        /** @var Page $page */
+        $page = $event->arguments(0);
+
+        // Read prior state (what we believe exists remotely)
+        $uploaded = [];
+        if (method_exists($page, 'meta')) {
+            $u = $page->meta('WireBunnyCDN_uploaded');
+            if (is_array($u)) $uploaded = $u;
+        } else {
+            $uploaded = $this->wire('cache')->getFor('WireBunnyCDN', "uploaded-$page->id") ?: [];
+        }
+
+        // Build the set of keys that SHOULD exist after this save
+        $currentKeys = [];
+
+        foreach ($page->fields as $field) {
+            $ft = $field->type;
+            if (!($ft instanceof FieldtypeFile) && !($ft instanceof FieldtypeImage)) continue;
+
+            /** @var Pagefiles $files */
+            $files = $page->get($field->name);
+            if (!$files instanceof Pagefiles) continue;
+
+            foreach ($files as $pf) {
+                $key = $this->storageKeyFor($pf);
+                $currentKeys[$key] = true;
+
+                // push original
+                $this->offloadOne($pf, $uploaded);
+
+                // push variations
+                if ($pf instanceof Pageimage) {
+                    foreach ($pf->getVariations() as $var) {
+                        $vKey = $this->storageKeyFor($var);
+                        $currentKeys[$vKey] = true;
+                        $this->offloadOne($var, $uploaded);
+                    }
+                }
+            }
+        }
+
+        // Anything we previously uploaded but is NOT in current => delete remotely
+        foreach (array_keys($uploaded) as $key) {
+            if (!isset($currentKeys[$key])) {
+                $this->deleteFromBunny($key);
+                unset($uploaded[$key]);
+            }
+        }
+
+        // Persist updated state
+        if (method_exists($page, 'meta')) {
+            $page->meta('WireBunnyCDN_uploaded', $uploaded);
+        } else {
+            $this->wire('cache')->saveFor('WireBunnyCDN', "uploaded-$page->id", $uploaded, 60 * 60 * 24 * 30);
+        }
+    }
+
+
+    /** Offload a single Pagefile/Pageimage if needed */
+    protected function offloadOne(Pagefile $pf, array &$uploaded)
+    {
+        $path = $pf->filename();               // local absolute path
+        if (!is_file($path)) return;
+
+        $key  = $this->storageKeyFor($pf);     // storage path e.g. /site/assets/files/1234/file.jpg
+        $hash = md5_file($path) ?: (string)filemtime($path);
+
+        if (isset($uploaded[$key]) && $uploaded[$key] === $hash) return; // already up-to-date
+
+        // push
+        $ok = $this->pushToBunny($key, $path);
+        if ($ok) {
+            $uploaded[$key] = $hash;
+
+            // Optional: remove local copy to truly “offload”
+            // CAUTION: only do this if you’re confident variations are pushed and you don’t need local fallback
+            // @unlink($path);
+        }
+    }
+
+    /** Compute a stable storage key rooted from /site/assets/files */
+    protected function storageKeyFor(Pagefile $pf)
+    {
+        $root = rtrim($this->config->paths->root, '/');
+        $rel = preg_replace('~^' . preg_quote($root, '~') . '~', '', $pf->filename());
+        return $rel; // e.g. /site/assets/files/1234/image.800x600.jpg
+    }
+
+    /** Push to Bunny Storage over HTTP API (simple PUT). You can swap this for S3 if you prefer. */
+    protected function pushToBunny(string $key, string $localPath): bool
+    {
+        if (!$this->storageZone || !$this->storageAccessKey) {
+            $this->log("Missing zone or access key");
+            return false;
+        }
+
+        $zone = $this->storageZone;
+        $regionPrefix = $this->storageRegion ? $this->storageRegion . '.' : ''; // region optional
+        $url = "https://{$regionPrefix}storage.bunnycdn.com/" . ltrim($zone, '/') . $key;
+
+        $this->log("PUT $url");
+
+        $ch = curl_init($url);
+        $fh = fopen($localPath, 'rb');
+        curl_setopt_array($ch, [
+            CURLOPT_PUT => true,
+            CURLOPT_INFILE => $fh,
+            CURLOPT_INFILESIZE => filesize($localPath),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'AccessKey: ' . $this->storageAccessKey,
+                'Content-Type: application/octet-stream'
+            ],
+            CURLOPT_TIMEOUT => 60
+        ]);
+        $res = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+        fclose($fh);
+
+        $this->log("Upload result http=$code err=" . ($err ?: '-') . " res=" . substr((string)$res, 0, 200));
+
+        if ($code >= 200 && $code < 300) return true;
+        return false;
+    }
+
+    /** Delete from storage when PW deletes a file */
+    public function deleteFromStorage(HookEvent $event)
+    {
+        /** @var Pagefile $pf */
+        $pf = $event->object;
+        $key = $this->storageKeyFor($pf);
+        $this->deleteFromBunny($key);
+    }
+
+
+    protected function deleteFromBunny(string $key): bool
+    {
+        if (!$this->storageZone || !$this->storageAccessKey) return false;
+
+        $zone = $this->storageZone;
+        $regionPrefix = $this->storageRegion ? $this->storageRegion . '.' : '';
+        $url = "https://{$regionPrefix}storage.bunnycdn.com/" . ltrim($zone, '/') . $key;
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST => 'DELETE',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'AccessKey: ' . $this->storageAccessKey
+            ],
+            CURLOPT_TIMEOUT => 30
+        ]);
+        $res  = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+
+        if ($code === 404) {
+            // Already gone – that’s fine (idempotent)
+            $this->log("DELETE $url -> 404 (already deleted)");
+            return true;
+        }
+
+        if ($code >= 200 && $code < 300) {
+            $this->log("DELETE $url -> $code");
+            return true;
+        }
+
+        $this->log("Bunny delete failed http=$code err={$err} res=" . substr((string)$res, 0, 200));
+        return false;
+    }
+
+    public function afterImageSize(HookEvent $event)
+    {
+        /** @var Pageimage|null $new */
+        $new = $event->return;
+        if (!$new instanceof Pageimage) return;
+
+        // Read existing uploaded map
+        $page = $new->page ?? null;
+        $uploaded = [];
+        if ($page instanceof Page && method_exists($page, 'meta')) {
+            $u = $page->meta('WireBunnyCDN_uploaded');
+            if (is_array($u)) $uploaded = $u;
+        }
+
+        // Push the freshly-created variation
+        $this->offloadOne($new, $uploaded);
+
+        // Persist updated state
+        if ($page instanceof Page && method_exists($page, 'meta')) {
+            $page->meta('WireBunnyCDN_uploaded', $uploaded);
+        }
+    }
+
+
+    protected function buildCdnBase(string $absPath): string
+    {
+        // If someone set cdnDomain to a *.storage.bunnycdn.com host, inject the storage zone
+        if (preg_match('~://[^/]*\.storage\.bunnycdn\.com$~', $this->cdnDomain) && $this->storageZone) {
+            return rtrim($this->cdnDomain, '/') . '/' . ltrim($this->storageZone, '/') . $absPath;
+        }
+        return rtrim($this->cdnDomain, '/') . $absPath;
+    }
+
+    /** @return array{0:int,1:int} */
+    protected function parseVariationDims(Pageimage $img): array
+    {
+        // Matches image.80x80.jpg / image.800x0.webp etc.
+        if (preg_match('~\.(\d+)x(\d+)\.[a-z0-9]+$~i', $img->basename(), $m)) {
+            return [(int)$m[1], (int)$m[2]];
+        }
+        return [0, 0];
+    }
+
+    protected function log($msg)
+    {
+        wire('log')->save('WireBunnyCdn', (string)$msg);
+    }
+}
