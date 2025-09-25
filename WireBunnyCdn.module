@@ -4,7 +4,7 @@ namespace ProcessWire;
 
 /**
  * @package   WireBunnyCdn
- * @author    Jonathan G <Warp Designs>
+ * @author    Jonathan G <Warp Designk>
  * @link      https://warp-design.co.uk
  * @copyright Copyright (c) Warp Design
  * @license   https://opensource.org/licenses/MIT
@@ -39,6 +39,8 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
     protected $preferLocalIfExists;
     /** @var bool */
     protected $useBunnyOptimizerForSize;
+    /** @var string keep|variations|all */
+    protected $removeLocalMode;
 
     public function __construct()
     {
@@ -55,7 +57,9 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
         $this->storageAccessKey           = (string)($cfg['storageAccessKey'] ?? '');
         $this->storageRegion              = (string)($cfg['storageRegion'] ?? '');
         $this->preferLocalIfExists        = (bool)($cfg['preferLocalIfExists'] ?? false);
-        $this->useBunnyOptimizerForSize   = (bool)($cfg['useBunnyOptimizerForSize'] ?? false);
+        $this->removeLocalMode = (string)($cfg['removeLocalMode'] ?? 'keep'); // keep|variations|all
+        $this->useBunnyOptimizerForSize = (bool)($cfg['useBunnyOptimizerForSize'] ?? false);
+
 
         if ($this->cdnDomain) {
             $this->addHookAfter('Pagefile::url', $this, 'rewriteUrlToCDN');
@@ -105,6 +109,18 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
         $f->value = $data['storageRegion'] ?? '';
         $inputfields->add($f);
 
+        $s = wire('modules')->get('InputfieldSelect');
+        $s->name  = 'removeLocalMode';
+        $s->label = 'Remove local files after upload';
+        $s->options = [
+            'keep'       => 'Keep all local files (recommended default)',
+            'variations' => 'Remove local image variations only',
+            'all'        => 'Remove originals & variations (requires Bunny Optimizer or no further sizing)'
+        ];
+        $s->value = $data['removeLocalMode'] ?? 'keep';
+        $inputfields->add($s);
+
+
         $f = wire('modules')->get('InputfieldCheckbox');
         $f->name = 'preferLocalIfExists';
         $f->label = 'Prefer local URL if the file exists locally (front-end only)';
@@ -128,48 +144,34 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
 
         /** @var Pagefile $pf */
         $pf  = $event->object;
-        $url = $event->return;
 
-        // Handle front end image rendering - note in admin remote URLs may not display until page is saved and image is uploaded to CDN
-        $absPath = parse_url($this->config->urls->httpRoot . ltrim($url, '/'), PHP_URL_PATH);
-
-        // Prefer local if the physical file exists - this helps if you have existing local files you want to keep using from before CDN was implemented
-        if ($this->preferLocalIfExists) {
-            $localPath = $pf->filename(); // absolute file path
-            if (is_file($localPath)) {
-                // Leave $event->return untouched (local URL)
-                return;
-            }
+        // 1) Prefer local URL if the physical file exists (optional feature)
+        if (!empty($this->preferLocalIfExists) && is_file($pf->filename())) {
+            return; // leave $event->return untouched (local URL)
         }
 
-        /**
-         * Handle image sizing either with Bunny Optimizer or ProcessWire variations:
-         */
-        // (2) If using Bunny Optimizer for sized variations, detect dimensions in filename
-        if ($this->useBunnyOptimizerForSize && $pf instanceof Pageimage) {
-            // If this Pageimage is a variation like .../image.80x80.jpg, parse dims
-            if (preg_match('~\.(\d+)x(\d+)(?:\.[a-z0-9]+)$~i', $pf->basename())) {
-                [$w, $h] = $this->parseVariationDims($pf);
-                if ($w || $h) {
-                    // Build URL to the ORIGINAL image on CDN + ?width=&height=
-                    $orig = method_exists($pf, 'getOriginal') ? $pf->getOriginal() : null;
-                    if ($orig instanceof Pageimage) {
-                        $origPath = parse_url($this->config->urls->httpRoot . ltrim($orig->url, '/'), PHP_URL_PATH);
-                        $base = $this->buildCdnBase($origPath);
-                        // Minimal set: width/height (Bunny Optimizer fits/crops depending on settings) 
-                        // You can extend with quality/format/etc later.
-                        $qs = [];
-                        if ($w) $qs[] = 'width=' . (int)$w;
-                        if ($h) $qs[] = 'height=' . (int)$h;
-                        $event->return = $base . (count($qs) ? ('?' . implode('&', $qs)) : '');
-                        return;
-                    }
+        // 2) Build relative path from filesystem (never from the current URL)
+        $relPath = $this->relPathFromFilename($pf->filename());
+
+        // 3) Bunny Optimizer mode for sized variations
+        if (!empty($this->useBunnyOptimizerForSize) && $pf instanceof Pageimage) {
+            [$w, $h] = $this->parseVariationDims($pf);
+            if ($w || $h) {
+                $orig = method_exists($pf, 'getOriginal') ? $pf->getOriginal() : null;
+                if ($orig instanceof Pageimage) {
+                    $origRel = $this->relPathFromFilename($orig->filename());
+                    $base = $this->buildCdnBase($origRel);
+                    $qs = [];
+                    if ($w) $qs[] = 'width=' . (int)$w;
+                    if ($h) $qs[] = 'height=' . (int)$h;
+                    $event->return = $base . ($qs ? ('?' . implode('&', $qs)) : '');
+                    return;
                 }
             }
         }
 
-        // (3) Default: just rewrite to CDN host (works for originals and pre-rendered variations)
-        $event->return = $this->buildCdnBase($absPath);
+        // 4) Default: CDN for the exact file path
+        $event->return = $this->buildCdnBase($relPath);
     }
 
 
@@ -250,9 +252,24 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
         if ($ok) {
             $uploaded[$key] = $hash;
 
-            // Optional: remove local copy to truly “offload”
-            // CAUTION: only do this if you’re confident variations are pushed and you don’t need local fallback
-            // @unlink($path);
+            // Handle local cleanup according to mode
+            if ($this->removeLocalMode !== 'keep') {
+                $isImage      = ($pf instanceof Pageimage);
+                $isVariation  = $isImage && method_exists($pf, 'isVariation') ? $pf->isVariation() : false;
+
+                $canRemoveAll = ($this->removeLocalMode === 'all');
+                $canRemoveVar = ($this->removeLocalMode === 'variations');
+
+                // Safety: if removing originals, strongly recommend Optimizer or no on-the-fly sizing
+                if ($canRemoveAll) {
+                    if (!$this->useBunnyOptimizerForSize) {
+                        $this->log('Warning: removeLocalMode=all without Optimizer. Further size() calls will fail unless files are re-fetched.');
+                    }
+                    @unlink($path);
+                } elseif ($canRemoveVar && $isVariation) {
+                    @unlink($path);
+                }
+            }
         }
     }
 
@@ -373,6 +390,24 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
         }
     }
 
+    /** @return array{0:int,1:int} */
+    protected function parseVariationDims(Pageimage $img): array
+    {
+        // Matches image.80x80.jpg / image.800x0.webp etc.
+        if (preg_match('~\.(\d+)x(\d+)\.[a-z0-9]+$~i', $img->basename(), $m)) {
+            return [(int)$m[1], (int)$m[2]];
+        }
+        return [0, 0];
+    }
+
+    protected function relPathFromFilename(string $filename): string
+    {
+        $root = rtrim($this->config->paths->root, '/');
+        $path = str_replace('\\', '/', $filename);
+        if (strpos($path, $root) === 0) $path = substr($path, strlen($root));
+        if ($path === '' || $path[0] !== '/') $path = '/' . $path;
+        return $path; // e.g. /site/assets/files/1234/image.80x80.jpg
+    }
 
     protected function buildCdnBase(string $absPath): string
     {
@@ -383,15 +418,6 @@ class WireBunnyCdn extends WireData implements Module, ConfigurableModule
         return rtrim($this->cdnDomain, '/') . $absPath;
     }
 
-    /** @return array{0:int,1:int} */
-    protected function parseVariationDims(Pageimage $img): array
-    {
-        // Matches image.80x80.jpg / image.800x0.webp etc.
-        if (preg_match('~\.(\d+)x(\d+)\.[a-z0-9]+$~i', $img->basename(), $m)) {
-            return [(int)$m[1], (int)$m[2]];
-        }
-        return [0, 0];
-    }
 
     protected function log($msg)
     {
